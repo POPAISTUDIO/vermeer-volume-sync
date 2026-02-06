@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -o pipefail
 
 echo "=== Vermeer Volume Sync ==="
 echo "Starting sync at $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
@@ -15,10 +15,19 @@ if [ -z "$SOURCE_ENDPOINT" ] || [ -z "$SOURCE_VOLUME_ID" ]; then
     exit 1
 fi
 
+# Extract region from endpoint URL (e.g., https://s3api-eu-ro-1.runpod.io -> eu-ro-1)
+# Format: https://s3api-{region}.runpod.io
+REGION=$(echo "$SOURCE_ENDPOINT" | sed -E 's|https://s3api-([^.]+)\.runpod\.io.*|\1|')
+if [ -z "$REGION" ] || [ "$REGION" = "$SOURCE_ENDPOINT" ]; then
+    echo "WARNING: Could not extract region from endpoint, using default"
+    REGION="us-east-1"
+fi
+echo "Detected region: $REGION"
+
 # Configure AWS CLI
 export AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY"
 export AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY"
-export AWS_DEFAULT_REGION="us-east-1"
+export AWS_DEFAULT_REGION="$REGION"
 
 # Target directory (RunPod mounts volumes at /workspace)
 TARGET_DIR="${TARGET_DIR:-/workspace}"
@@ -31,12 +40,13 @@ echo ""
 echo "=== Starting S3 Sync ==="
 SYNC_START=$(date +%s)
 
+# Use pipefail to capture aws exit code through the pipe
 aws s3 sync "s3://${SOURCE_VOLUME_ID}/" "${TARGET_DIR}/" \
     --endpoint-url "$SOURCE_ENDPOINT" \
     --no-progress \
     2>&1 | tee /tmp/sync.log
 
-SYNC_STATUS=$?
+SYNC_STATUS=${PIPESTATUS[0]}
 SYNC_END=$(date +%s)
 SYNC_DURATION=$((SYNC_END - SYNC_START))
 
