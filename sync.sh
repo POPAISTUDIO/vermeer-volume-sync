@@ -40,13 +40,20 @@ echo ""
 echo "=== Starting S3 Sync ==="
 SYNC_START=$(date +%s)
 
-# Use pipefail to capture aws exit code through the pipe
+# Run aws s3 sync with explicit region flag
 aws s3 sync "s3://${SOURCE_VOLUME_ID}/" "${TARGET_DIR}/" \
     --endpoint-url "$SOURCE_ENDPOINT" \
+    --region "$REGION" \
     --no-progress \
     2>&1 | tee /tmp/sync.log
 
 SYNC_STATUS=${PIPESTATUS[0]}
+
+# Fallback: check for fatal errors in log if PIPESTATUS didn't capture it
+if [ $SYNC_STATUS -eq 0 ] && grep -q "fatal error" /tmp/sync.log; then
+    echo "WARNING: Detected fatal error in log despite exit code 0"
+    SYNC_STATUS=1
+fi
 SYNC_END=$(date +%s)
 SYNC_DURATION=$((SYNC_END - SYNC_START))
 
