@@ -121,42 +121,48 @@ echo "Fast S3 API discovery started in background (list-objects-v2)"
 # Report initial state
 report_progress "syncing" 0 0
 
-# ── Background progress reporter: every 10s, POST current counts ──
-if [ -n "$PROGRESS_CALLBACK_URL" ]; then
-    (
-        while true; do
-            sleep 10
-            CURRENT=$(cat "$PROGRESS_FILE" 2>/dev/null || echo "0")
-            TOTAL=$(cat "$FILES_TOTAL_FILE" 2>/dev/null || echo "0")
-            report_progress "syncing" "$CURRENT" "$TOTAL"
-        done
-    ) &
-    REPORTER_PID=$!
-    echo "Progress reporter started (PID: $REPORTER_PID)"
-fi
-
-# ── Run actual sync immediately — zero wait ──
+# ── Run sync in background, writing directly to log file ──
+# IMPORTANT: No pipes! aws s3 sync (Python) full-buffers when piped,
+# causing zero output until buffer fills. Writing to a file avoids this.
 aws s3 sync "s3://${SOURCE_VOLUME_ID}/" "${TARGET_DIR}/" \
     --endpoint-url "$SOURCE_ENDPOINT" \
     --region "$REGION" \
     "${SYNC_EXCLUDES[@]}" \
     --no-progress \
-    2>&1 | tee /tmp/sync.log | awk -v pf="$PROGRESS_FILE" '
-        /download:/ {
-            count++
-            print count > pf
-            close(pf)
-        }
-        { print }
-    '
+    > /tmp/sync.log 2>&1 &
+SYNC_PID=$!
+echo "Sync started (PID: $SYNC_PID)"
 
-SYNC_STATUS=${PIPESTATUS[0]}
+# ── Monitor loop: count downloads + report progress every 5s ──
+PREV_COUNT=0
+while kill -0 "$SYNC_PID" 2>/dev/null; do
+    sleep 5
+    COUNT=$(grep -c "download:" /tmp/sync.log 2>/dev/null || echo "0")
+    TOTAL=$(cat "$FILES_TOTAL_FILE" 2>/dev/null || echo "0")
 
-# ── Cleanup background processes ──
-if [ -n "$REPORTER_PID" ]; then
-    kill "$REPORTER_PID" 2>/dev/null
-    wait "$REPORTER_PID" 2>/dev/null
-fi
+    if [ "$COUNT" -ne "$PREV_COUNT" ]; then
+        if [ "$TOTAL" -gt 0 ]; then
+            PCT=$((COUNT * 100 / TOTAL))
+            echo "[progress] ${COUNT} files synced / ~${TOTAL} in bucket (${PCT}%)"
+        else
+            echo "[progress] ${COUNT} files synced"
+        fi
+        echo "$COUNT" > "$PROGRESS_FILE"
+        PREV_COUNT=$COUNT
+    fi
+
+    report_progress "syncing" "$COUNT" "$TOTAL"
+done
+
+wait "$SYNC_PID"
+SYNC_STATUS=$?
+
+# Print sync log for container debugging
+echo ""
+echo "=== Sync Log (last 50 lines) ==="
+tail -n 50 /tmp/sync.log 2>/dev/null
+
+# ── Cleanup background discovery ──
 if kill -0 "$DISCOVERY_PID" 2>/dev/null; then
     kill "$DISCOVERY_PID" 2>/dev/null
     wait "$DISCOVERY_PID" 2>/dev/null
