@@ -78,6 +78,7 @@ report_progress "discovering" 0 0
 DRYRUN_OUTPUT="/tmp/dryrun.txt"
 FILES_TOTAL=0
 DISCOVERY_TIMEOUT=30
+DISCOVERY_SKIPPED=false
 
 # Run dryrun in background with timeout
 aws s3 sync "s3://${SOURCE_VOLUME_ID}/" "${TARGET_DIR}/" \
@@ -94,14 +95,15 @@ while kill -0 "$DRYRUN_PID" 2>/dev/null; do
         echo "Discovery timed out after ${DISCOVERY_TIMEOUT}s, skipping file count"
         kill "$DRYRUN_PID" 2>/dev/null
         wait "$DRYRUN_PID" 2>/dev/null
+        DISCOVERY_SKIPPED=true
         break
     fi
     sleep 1
     WAITED=$((WAITED + 1))
 done
 
-# Check if dryrun completed (PID no longer running means it finished)
-if ! kill -0 "$DRYRUN_PID" 2>/dev/null; then
+# If dryrun completed in time, parse its output
+if [ "$DISCOVERY_SKIPPED" = false ]; then
     wait "$DRYRUN_PID"
     DRYRUN_EXIT=$?
     if [ "$DRYRUN_EXIT" -eq 0 ]; then
@@ -110,12 +112,10 @@ if ! kill -0 "$DRYRUN_PID" 2>/dev/null; then
     else
         echo "WARNING: Dryrun failed (exit $DRYRUN_EXIT), proceeding without file count"
     fi
-else
-    echo "Discovery still running, proceeding without file count"
 fi
 
-# Edge case: nothing to sync
-if [ "$FILES_TOTAL" -eq 0 ]; then
+# Edge case: dryrun completed and found 0 files → already synced
+if [ "$DISCOVERY_SKIPPED" = false ] && [ "$FILES_TOTAL" -eq 0 ]; then
     echo "No files to sync — already up to date"
     report_progress "already_synced" 0 0
 
