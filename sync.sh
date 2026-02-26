@@ -121,26 +121,32 @@ echo "Fast S3 API discovery started in background (list-objects-v2)"
 # Report initial state
 report_progress "syncing" 0 0
 
-# ── Run sync in background, writing directly to log file ──
-# IMPORTANT: No pipes! aws s3 sync (Python) full-buffers when piped,
-# causing zero output until buffer fills. Writing to a file avoids this.
-aws s3 sync "s3://${SOURCE_VOLUME_ID}/" "${TARGET_DIR}/" \
+# ── Run sync in background ──
+# PYTHONUNBUFFERED=1 forces aws-cli (Python) to flush every write immediately.
+# Without this, Python buffers output to files AND pipes (~4-8KB blocks),
+# so nothing appears until the buffer fills or the process exits.
+PYTHONUNBUFFERED=1 aws s3 sync "s3://${SOURCE_VOLUME_ID}/" "${TARGET_DIR}/" \
     --endpoint-url "$SOURCE_ENDPOINT" \
     --region "$REGION" \
     "${SYNC_EXCLUDES[@]}" \
     --no-progress \
     > /tmp/sync.log 2>&1 &
 SYNC_PID=$!
-echo "Sync started (PID: $SYNC_PID)"
+echo "Sync started (PID: $SYNC_PID, PYTHONUNBUFFERED=1)"
 
 # ── Monitor loop: count downloads + report progress every 5s ──
 PREV_COUNT=0
+TICK=0
+LOG_SIZE_PREV=0
 while kill -0 "$SYNC_PID" 2>/dev/null; do
     sleep 5
+    TICK=$((TICK + 1))
     COUNT=$(grep -c "download:" /tmp/sync.log 2>/dev/null || true)
     COUNT=${COUNT:-0}
     TOTAL=$(cat "$FILES_TOTAL_FILE" 2>/dev/null || true)
     TOTAL=${TOTAL:-0}
+    LOG_SIZE=$(wc -c < /tmp/sync.log 2>/dev/null || true)
+    LOG_SIZE=${LOG_SIZE:-0}
 
     if [ "$COUNT" -ne "$PREV_COUNT" ]; then
         if [ "$TOTAL" -gt 0 ]; then
@@ -151,6 +157,9 @@ while kill -0 "$SYNC_PID" 2>/dev/null; do
         fi
         echo "$COUNT" > "$PROGRESS_FILE"
         PREV_COUNT=$COUNT
+    elif [ $((TICK % 6)) -eq 0 ]; then
+        # Heartbeat every 30s so logs show the monitor is alive
+        echo "[heartbeat] sync running, log=${LOG_SIZE}B, files=${COUNT}, total=~${TOTAL}"
     fi
 
     report_progress "syncing" "$COUNT" "$TOTAL"
