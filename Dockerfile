@@ -1,8 +1,9 @@
 FROM alpine:3.19
 
-# Install dependencies
-RUN apk add --no-cache \
-    aws-cli \
+# Install rclone (from community repo), curl, bash, jq
+RUN echo "https://dl-cdn.alpinelinux.org/alpine/v3.19/community" >> /etc/apk/repositories && \
+    apk add --no-cache \
+    rclone \
     curl \
     bash \
     jq

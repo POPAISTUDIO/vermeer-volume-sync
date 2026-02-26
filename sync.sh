@@ -1,7 +1,7 @@
 #!/bin/bash
 set -o pipefail
 
-echo "=== Vermeer Volume Sync ==="
+echo "=== Vermeer Volume Sync (rclone) ==="
 echo "Starting sync at $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
 # ── Validate environment ──
@@ -20,21 +20,36 @@ if [ -z "$REGION" ] || [ "$REGION" = "$SOURCE_ENDPOINT" ]; then
 fi
 echo "Region: $REGION"
 
-export AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY"
-export AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY"
-export AWS_DEFAULT_REGION="$REGION"
-
 TARGET_DIR="${TARGET_DIR:-/workspace}"
-echo "Source: s3://${SOURCE_VOLUME_ID}/"
+echo "Source: :s3:${SOURCE_VOLUME_ID}/"
 echo "Target: ${TARGET_DIR}"
 
-SYNC_EXCLUDES=(
-    --exclude ".venv/*"
-    --exclude "__pycache__/*"
+# ── Configure rclone S3 backend ──
+cat > /tmp/rclone.conf << EOF
+[source]
+type = s3
+provider = Other
+access_key_id = ${S3_ACCESS_KEY}
+secret_access_key = ${S3_SECRET_KEY}
+endpoint = ${SOURCE_ENDPOINT}
+region = ${REGION}
+force_path_style = true
+no_check_bucket = true
+EOF
+
+RCLONE_FLAGS=(
+    --config /tmp/rclone.conf
+    --stats 10s
+    --stats-log-level NOTICE
+    --use-json-log
+    --transfers 8
+    --checkers 16
+    --exclude ".venv/**"
+    --exclude "__pycache__/**"
     --exclude "*.pyc"
-    --exclude "node_modules/*"
-    --exclude ".cache/*"
-    --exclude ".tmp/*"
+    --exclude "node_modules/**"
+    --exclude ".cache/**"
+    --exclude ".tmp/**"
 )
 
 # ── Progress callback (non-blocking, never fails the sync) ──
@@ -52,109 +67,96 @@ report_progress() {
         > /dev/null 2>&1 || true
 }
 
-# ── Count files on disk (the source of truth for progress) ──
-count_local_files() {
-    find "$TARGET_DIR" -type f 2>/dev/null | wc -l | tr -d ' '
-}
-
 echo ""
 echo "=== Starting ==="
 SYNC_START=$(date +%s)
-
-# Snapshot initial file count before sync
-INITIAL_FILES=$(count_local_files)
-echo "Files already on disk: $INITIAL_FILES"
-
-# ── Background: fast S3 object count via API pagination ──
-FILES_TOTAL_FILE="/tmp/files_total"
-echo "0" > "$FILES_TOTAL_FILE"
-(
-    TOTAL=0
-    TOKEN=""
-    while true; do
-        CMD=(aws s3api list-objects-v2 --bucket "$SOURCE_VOLUME_ID" --endpoint-url "$SOURCE_ENDPOINT" --output json)
-        [ -n "$TOKEN" ] && CMD+=(--continuation-token "$TOKEN")
-        RESULT=$("${CMD[@]}" 2>/dev/null) || break
-        TOTAL=$((TOTAL + $(echo "$RESULT" | jq '.KeyCount // 0')))
-        echo "$TOTAL" > "$FILES_TOTAL_FILE"
-        IS_TRUNCATED=$(echo "$RESULT" | jq -r '.IsTruncated // false')
-        [ "$IS_TRUNCATED" = "true" ] || break
-        TOKEN=$(echo "$RESULT" | jq -r '.NextContinuationToken // empty')
-        [ -z "$TOKEN" ] && break
-    done
-    echo "[discovery] $TOTAL objects in S3 bucket" >&2
-) &
-DISCOVERY_PID=$!
-
 report_progress "syncing" 0 0
 
-# ── Run sync silently in background ──
-aws s3 sync "s3://${SOURCE_VOLUME_ID}/" "${TARGET_DIR}/" \
-    --endpoint-url "$SOURCE_ENDPOINT" \
-    --region "$REGION" \
-    "${SYNC_EXCLUDES[@]}" \
-    --only-show-errors \
-    > /tmp/sync_errors.log 2>&1 &
-SYNC_PID=$!
-echo "Sync PID: $SYNC_PID"
+# Track last known stats for final report
+LAST_STATS="/tmp/last_stats"
+echo "0 0 0 0" > "$LAST_STATS"
 
-# ── Monitor: count files on disk every 10s ──
-# No dependency on aws CLI output. The filesystem is the source of truth.
-while kill -0 "$SYNC_PID" 2>/dev/null; do
-    sleep 10
+# ── Run rclone sync — parse JSON stats from stderr ──
+rclone sync "source:${SOURCE_VOLUME_ID}/" "${TARGET_DIR}/" \
+    "${RCLONE_FLAGS[@]}" \
+    2>&1 | while IFS= read -r line; do
+        # Identify stats lines by the presence of .stats key
+        STATS=$(echo "$line" | jq -c '.stats // empty' 2>/dev/null)
+        if [ -n "$STATS" ] && [ "$STATS" != "null" ]; then
+            TRANSFERS=$(echo "$STATS" | jq '.transfers // 0')
+            TOTAL_TRANSFERS=$(echo "$STATS" | jq '.totalTransfers // 0')
+            BYTES=$(echo "$STATS" | jq '.bytes // 0')
+            TOTAL_BYTES=$(echo "$STATS" | jq '.totalBytes // 0')
+            SPEED=$(echo "$STATS" | jq '.speed // 0')
+            ETA=$(echo "$STATS" | jq '.eta // 0')
+            CHECKS=$(echo "$STATS" | jq '.checks // 0')
+            TOTAL_CHECKS=$(echo "$STATS" | jq '.totalChecks // 0')
 
-    CURRENT_FILES=$(count_local_files)
-    NEW_FILES=$((CURRENT_FILES - INITIAL_FILES))
-    TOTAL=$(cat "$FILES_TOTAL_FILE" 2>/dev/null || true)
-    TOTAL=${TOTAL:-0}
+            # Persist for final report (while loop runs in subshell)
+            echo "$TRANSFERS $TOTAL_TRANSFERS $CHECKS $TOTAL_CHECKS" > "$LAST_STATS"
 
-    if [ "$TOTAL" -gt 0 ]; then
-        PCT=$((CURRENT_FILES * 100 / TOTAL))
-        echo "[progress] ${CURRENT_FILES} files on disk / ~${TOTAL} in S3 (+${NEW_FILES} new, ${PCT}%)"
-    else
-        echo "[progress] ${CURRENT_FILES} files on disk (+${NEW_FILES} new)"
-    fi
+            # Human-readable progress line
+            if [ "$TOTAL_BYTES" -gt 0 ]; then
+                BYTES_MB=$((BYTES / 1048576))
+                TOTAL_MB=$((TOTAL_BYTES / 1048576))
+                SPEED_MB=$(echo "$SPEED" | awk '{printf "%d", $1/1048576}')
+                ETA_S=$(echo "$ETA" | awk '{printf "%d", $1}')
+                PCT=$((BYTES * 100 / TOTAL_BYTES))
+                echo "[progress] ${TRANSFERS}/${TOTAL_TRANSFERS} files, ${BYTES_MB}/${TOTAL_MB} MB, ${PCT}%, ${SPEED_MB} MB/s, ETA ${ETA_S}s"
+                report_progress "syncing" "$TRANSFERS" "$TOTAL_TRANSFERS"
+            elif [ "$TOTAL_TRANSFERS" -gt 0 ]; then
+                PCT=$((TRANSFERS * 100 / TOTAL_TRANSFERS))
+                echo "[progress] ${TRANSFERS}/${TOTAL_TRANSFERS} files (${PCT}%)"
+                report_progress "syncing" "$TRANSFERS" "$TOTAL_TRANSFERS"
+            elif [ "$TOTAL_CHECKS" -gt 0 ]; then
+                echo "[progress] checking ${CHECKS}/${TOTAL_CHECKS}..."
+                report_progress "discovering" "$CHECKS" "$TOTAL_CHECKS"
+            else
+                echo "[progress] starting..."
+            fi
+        else
+            # Non-stats: show errors and warnings only
+            LEVEL=$(echo "$line" | jq -r '.level // empty' 2>/dev/null)
+            MSG=$(echo "$line" | jq -r '.msg // empty' 2>/dev/null)
+            if [ -n "$MSG" ]; then
+                case "$LEVEL" in
+                    error)   echo "[ERROR] $MSG" ;;
+                    warning) echo "[WARN]  $MSG" ;;
+                esac
+            fi
+        fi
+    done
 
-    report_progress "syncing" "$CURRENT_FILES" "$TOTAL"
-done
+SYNC_STATUS=${PIPESTATUS[0]}
 
-wait "$SYNC_PID"
-SYNC_STATUS=$?
-
-# Cleanup discovery if still running
-kill "$DISCOVERY_PID" 2>/dev/null; wait "$DISCOVERY_PID" 2>/dev/null
-
-# Check for errors in sync log
-if [ $SYNC_STATUS -eq 0 ] && grep -q "fatal error" /tmp/sync_errors.log 2>/dev/null; then
-    SYNC_STATUS=1
-fi
-if [ -s /tmp/sync_errors.log ]; then
-    echo ""
-    echo "=== Sync Errors ==="
-    cat /tmp/sync_errors.log
-fi
+# Read last known stats from the subshell
+read FINAL_TRANSFERS FINAL_TOTAL_TRANSFERS FINAL_CHECKS FINAL_TOTAL_CHECKS < "$LAST_STATS" 2>/dev/null || true
+FINAL_TRANSFERS=${FINAL_TRANSFERS:-0}
+FINAL_TOTAL_TRANSFERS=${FINAL_TOTAL_TRANSFERS:-0}
+FINAL_CHECKS=${FINAL_CHECKS:-0}
+FINAL_TOTAL_CHECKS=${FINAL_TOTAL_CHECKS:-0}
 
 # ── Results ──
 SYNC_END=$(date +%s)
 SYNC_DURATION=$((SYNC_END - SYNC_START))
-FINAL_FILES=$(count_local_files)
-TOTAL=$(cat "$FILES_TOTAL_FILE" 2>/dev/null || true)
-TOTAL=${TOTAL:-0}
 
 echo ""
 echo "=== Sync Complete ==="
 echo "Duration: ${SYNC_DURATION}s"
-echo "Files on disk: ${FINAL_FILES} (was ${INITIAL_FILES}, +$((FINAL_FILES - INITIAL_FILES)) new)"
-echo "Objects in S3: ~${TOTAL}"
+echo "Files transferred: ${FINAL_TRANSFERS} / ${FINAL_TOTAL_TRANSFERS}"
+echo "Files checked: ${FINAL_CHECKS} / ${FINAL_TOTAL_CHECKS}"
 echo "Exit code: ${SYNC_STATUS}"
 
 if [ $SYNC_STATUS -eq 0 ]; then
     FINAL_STATUS="synced"
     echo "Status: SUCCESS"
-    if [ "$TOTAL" -gt 0 ]; then
-        report_progress "syncing" "$TOTAL" "$TOTAL"
+    # Report 100%
+    if [ "$FINAL_TOTAL_TRANSFERS" -gt 0 ]; then
+        report_progress "syncing" "$FINAL_TOTAL_TRANSFERS" "$FINAL_TOTAL_TRANSFERS"
+    elif [ "$FINAL_TOTAL_CHECKS" -gt 0 ]; then
+        report_progress "syncing" "$FINAL_TOTAL_CHECKS" "$FINAL_TOTAL_CHECKS"
     else
-        report_progress "syncing" "$FINAL_FILES" "$FINAL_FILES"
+        report_progress "syncing" 1 1
     fi
 else
     FINAL_STATUS="failed"
