@@ -137,8 +137,10 @@ echo "Sync started (PID: $SYNC_PID)"
 PREV_COUNT=0
 while kill -0 "$SYNC_PID" 2>/dev/null; do
     sleep 5
-    COUNT=$(grep -c "download:" /tmp/sync.log 2>/dev/null || echo "0")
-    TOTAL=$(cat "$FILES_TOTAL_FILE" 2>/dev/null || echo "0")
+    COUNT=$(grep -c "download:" /tmp/sync.log 2>/dev/null || true)
+    COUNT=${COUNT:-0}
+    TOTAL=$(cat "$FILES_TOTAL_FILE" 2>/dev/null || true)
+    TOTAL=${TOTAL:-0}
 
     if [ "$COUNT" -ne "$PREV_COUNT" ]; then
         if [ "$TOTAL" -gt 0 ]; then
@@ -176,8 +178,10 @@ fi
 
 SYNC_END=$(date +%s)
 SYNC_DURATION=$((SYNC_END - SYNC_START))
-FILES_SYNCED=$(cat "$PROGRESS_FILE" 2>/dev/null || echo "0")
-FILES_TOTAL=$(cat "$FILES_TOTAL_FILE" 2>/dev/null || echo "0")
+FILES_SYNCED=$(cat "$PROGRESS_FILE" 2>/dev/null || true)
+FILES_SYNCED=${FILES_SYNCED:-0}
+FILES_TOTAL=$(cat "$FILES_TOTAL_FILE" 2>/dev/null || true)
+FILES_TOTAL=${FILES_TOTAL:-0}
 
 echo ""
 echo "=== Sync Complete ==="
