@@ -35,43 +35,150 @@ TARGET_DIR="${TARGET_DIR:-/workspace}"
 echo "Source: s3://${SOURCE_VOLUME_ID}/ (endpoint: ${SOURCE_ENDPOINT})"
 echo "Target: ${TARGET_DIR}"
 
-# Run sync
-echo ""
-echo "=== Starting S3 Sync ==="
-SYNC_START=$(date +%s)
+# Exclusions: skip machine-specific / regenerable directories
+SYNC_EXCLUDES=(
+    --exclude ".venv/*"
+    --exclude "__pycache__/*"
+    --exclude "*.pyc"
+    --exclude "node_modules/*"
+    --exclude ".cache/*"
+    --exclude ".tmp/*"
+)
+echo "Excluding: .venv, __pycache__, *.pyc, node_modules, .cache, .tmp"
 
-# Run aws s3 sync with explicit region flag
-aws s3 sync "s3://${SOURCE_VOLUME_ID}/" "${TARGET_DIR}/" \
+# ── Progress reporting helper ──
+# Posts progress to PROGRESS_CALLBACK_URL (non-blocking, never fails the sync)
+report_progress() {
+    local phase="$1"
+    local synced="$2"
+    local total="$3"
+
+    if [ -z "$PROGRESS_CALLBACK_URL" ] || [ -z "$JOB_ID" ]; then
+        return
+    fi
+
+    local payload
+    payload=$(jq -n \
+        --arg job_id "$JOB_ID" \
+        --arg phase "$phase" \
+        --argjson synced "${synced:-0}" \
+        --argjson total "${total:-0}" \
+        '{job_id: $job_id, phase: $phase, files_synced: $synced, files_total: $total}')
+
+    curl -s -X POST "$PROGRESS_CALLBACK_URL" \
+        -H "Content-Type: application/json" \
+        -d "$payload" > /dev/null 2>&1 || true
+}
+
+# ── Phase 1: Discovery (dryrun) ──
+echo ""
+echo "=== Discovery Phase ==="
+report_progress "discovering" 0 0
+
+DRYRUN_OUTPUT="/tmp/dryrun.txt"
+FILES_TOTAL=0
+
+if aws s3 sync "s3://${SOURCE_VOLUME_ID}/" "${TARGET_DIR}/" \
     --endpoint-url "$SOURCE_ENDPOINT" \
     --region "$REGION" \
-    --no-progress \
-    2>&1 | tee /tmp/sync.log
+    "${SYNC_EXCLUDES[@]}" \
+    --dryrun 2>/dev/null > "$DRYRUN_OUTPUT"; then
 
-SYNC_STATUS=${PIPESTATUS[0]}
-
-# Fallback: check for fatal errors in log if PIPESTATUS didn't capture it
-if [ $SYNC_STATUS -eq 0 ] && grep -q "fatal error" /tmp/sync.log; then
-    echo "WARNING: Detected fatal error in log despite exit code 0"
-    SYNC_STATUS=1
-fi
-SYNC_END=$(date +%s)
-SYNC_DURATION=$((SYNC_END - SYNC_START))
-
-echo ""
-echo "=== Sync Complete ==="
-echo "Duration: ${SYNC_DURATION}s"
-echo "Exit code: ${SYNC_STATUS}"
-
-# Determine final status
-if [ $SYNC_STATUS -eq 0 ]; then
-    FINAL_STATUS="synced"
-    echo "Status: SUCCESS"
+    # Count lines that indicate a file would be transferred
+    FILES_TOTAL=$(grep -c "download:" "$DRYRUN_OUTPUT" 2>/dev/null || echo "0")
+    echo "Files to sync: $FILES_TOTAL"
 else
-    FINAL_STATUS="failed"
-    echo "Status: FAILED"
+    echo "WARNING: Dryrun failed, proceeding without progress tracking"
+    FILES_TOTAL=0
 fi
 
-# Send callback if URL provided
+# Edge case: nothing to sync
+if [ "$FILES_TOTAL" -eq 0 ]; then
+    echo "No files to sync — already up to date"
+    report_progress "already_synced" 0 0
+
+    SYNC_STATUS=0
+    SYNC_DURATION=0
+    FINAL_STATUS="synced"
+
+    # Jump to callback
+    echo "=== Sync Complete (no-op) ==="
+else
+    # Report discovery results
+    report_progress "syncing" 0 "$FILES_TOTAL"
+
+    # ── Phase 2: Actual sync with progress tracking ──
+    echo ""
+    echo "=== Starting S3 Sync ==="
+    SYNC_START=$(date +%s)
+
+    # Progress counter file (written by awk, read by reporter)
+    PROGRESS_FILE="/tmp/sync_progress"
+    echo "0" > "$PROGRESS_FILE"
+
+    # Background progress reporter: every 10s, POST current count
+    if [ -n "$PROGRESS_CALLBACK_URL" ] && [ "$FILES_TOTAL" -gt 0 ]; then
+        (
+            while true; do
+                sleep 10
+                CURRENT=$(cat "$PROGRESS_FILE" 2>/dev/null || echo "0")
+                report_progress "syncing" "$CURRENT" "$FILES_TOTAL"
+            done
+        ) &
+        REPORTER_PID=$!
+        echo "Progress reporter started (PID: $REPORTER_PID)"
+    fi
+
+    # Run sync, pipe through awk to count completed files
+    aws s3 sync "s3://${SOURCE_VOLUME_ID}/" "${TARGET_DIR}/" \
+        --endpoint-url "$SOURCE_ENDPOINT" \
+        --region "$REGION" \
+        "${SYNC_EXCLUDES[@]}" \
+        --no-progress \
+        2>&1 | tee /tmp/sync.log | awk -v pf="$PROGRESS_FILE" '
+            /download:/ {
+                count++
+                print count > pf
+                close(pf)
+            }
+            { print }
+        '
+
+    SYNC_STATUS=${PIPESTATUS[0]}
+
+    # Kill background reporter
+    if [ -n "$REPORTER_PID" ]; then
+        kill "$REPORTER_PID" 2>/dev/null
+        wait "$REPORTER_PID" 2>/dev/null
+    fi
+
+    # Fallback: check for fatal errors in log if PIPESTATUS didn't capture it
+    if [ $SYNC_STATUS -eq 0 ] && grep -q "fatal error" /tmp/sync.log; then
+        echo "WARNING: Detected fatal error in log despite exit code 0"
+        SYNC_STATUS=1
+    fi
+
+    SYNC_END=$(date +%s)
+    SYNC_DURATION=$((SYNC_END - SYNC_START))
+
+    echo ""
+    echo "=== Sync Complete ==="
+    echo "Duration: ${SYNC_DURATION}s"
+    echo "Exit code: ${SYNC_STATUS}"
+
+    # Determine final status
+    if [ $SYNC_STATUS -eq 0 ]; then
+        FINAL_STATUS="synced"
+        echo "Status: SUCCESS"
+        # Report 100% completion
+        report_progress "syncing" "$FILES_TOTAL" "$FILES_TOTAL"
+    else
+        FINAL_STATUS="failed"
+        echo "Status: FAILED"
+    fi
+fi
+
+# ── Phase 3: Send completion callback ──
 if [ -n "$CALLBACK_URL" ]; then
     echo ""
     echo "=== Sending Callback ==="
