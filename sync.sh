@@ -70,26 +70,48 @@ report_progress() {
         -d "$payload" > /dev/null 2>&1 || true
 }
 
-# ── Phase 1: Discovery (dryrun) ──
+# ── Phase 1: Discovery (dryrun with 30s timeout) ──
 echo ""
-echo "=== Discovery Phase ==="
+echo "=== Discovery Phase (max 30s) ==="
 report_progress "discovering" 0 0
 
 DRYRUN_OUTPUT="/tmp/dryrun.txt"
 FILES_TOTAL=0
+DISCOVERY_TIMEOUT=30
 
-if aws s3 sync "s3://${SOURCE_VOLUME_ID}/" "${TARGET_DIR}/" \
+# Run dryrun in background with timeout
+aws s3 sync "s3://${SOURCE_VOLUME_ID}/" "${TARGET_DIR}/" \
     --endpoint-url "$SOURCE_ENDPOINT" \
     --region "$REGION" \
     "${SYNC_EXCLUDES[@]}" \
-    --dryrun 2>/dev/null > "$DRYRUN_OUTPUT"; then
+    --dryrun 2>/dev/null > "$DRYRUN_OUTPUT" &
+DRYRUN_PID=$!
 
-    # Count lines that indicate a file would be transferred
-    FILES_TOTAL=$(grep -c "download:" "$DRYRUN_OUTPUT" 2>/dev/null || echo "0")
-    echo "Files to sync: $FILES_TOTAL"
+# Wait up to DISCOVERY_TIMEOUT seconds
+WAITED=0
+while kill -0 "$DRYRUN_PID" 2>/dev/null; do
+    if [ "$WAITED" -ge "$DISCOVERY_TIMEOUT" ]; then
+        echo "Discovery timed out after ${DISCOVERY_TIMEOUT}s, skipping file count"
+        kill "$DRYRUN_PID" 2>/dev/null
+        wait "$DRYRUN_PID" 2>/dev/null
+        break
+    fi
+    sleep 1
+    WAITED=$((WAITED + 1))
+done
+
+# Check if dryrun completed (PID no longer running means it finished)
+if ! kill -0 "$DRYRUN_PID" 2>/dev/null; then
+    wait "$DRYRUN_PID"
+    DRYRUN_EXIT=$?
+    if [ "$DRYRUN_EXIT" -eq 0 ]; then
+        FILES_TOTAL=$(grep -c "download:" "$DRYRUN_OUTPUT" 2>/dev/null || echo "0")
+        echo "Files to sync: $FILES_TOTAL"
+    else
+        echo "WARNING: Dryrun failed (exit $DRYRUN_EXIT), proceeding without file count"
+    fi
 else
-    echo "WARNING: Dryrun failed, proceeding without progress tracking"
-    FILES_TOTAL=0
+    echo "Discovery still running, proceeding without file count"
 fi
 
 # Edge case: nothing to sync
