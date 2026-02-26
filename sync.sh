@@ -16,7 +16,6 @@ if [ -z "$SOURCE_ENDPOINT" ] || [ -z "$SOURCE_VOLUME_ID" ]; then
 fi
 
 # Extract region from endpoint URL (e.g., https://s3api-eu-ro-1.runpod.io -> eu-ro-1)
-# Format: https://s3api-{region}.runpod.io
 REGION=$(echo "$SOURCE_ENDPOINT" | sed -E 's|https://s3api-([^.]+)\.runpod\.io.*|\1|')
 if [ -z "$REGION" ] || [ "$REGION" = "$SOURCE_ENDPOINT" ]; then
     echo "WARNING: Could not extract region from endpoint, using default"
@@ -47,7 +46,6 @@ SYNC_EXCLUDES=(
 echo "Excluding: .venv, __pycache__, *.pyc, node_modules, .cache, .tmp"
 
 # ── Progress reporting helper ──
-# Posts progress to PROGRESS_CALLBACK_URL (non-blocking, never fails the sync)
 report_progress() {
     local phase="$1"
     local synced="$2"
@@ -70,137 +68,134 @@ report_progress() {
         -d "$payload" > /dev/null 2>&1 || true
 }
 
-# ── Phase 1: Discovery (dryrun with 30s timeout) ──
+# ── Start sync immediately + fast parallel S3 API discovery ──
 echo ""
-echo "=== Discovery Phase (max 30s) ==="
-report_progress "discovering" 0 0
+echo "=== Starting S3 Sync ==="
+SYNC_START=$(date +%s)
 
-DRYRUN_OUTPUT="/tmp/dryrun.txt"
-FILES_TOTAL=0
-DISCOVERY_TIMEOUT=30
-DISCOVERY_SKIPPED=false
+# Progress counter file (written by awk during sync, read by reporter)
+PROGRESS_FILE="/tmp/sync_progress"
+echo "0" > "$PROGRESS_FILE"
 
-# Run dryrun in background with timeout
+# Total count file (written by background S3 API discovery, read by reporter)
+FILES_TOTAL_FILE="/tmp/files_total"
+echo "0" > "$FILES_TOTAL_FILE"
+
+# ── Fast parallel discovery using S3 API pagination ──
+# Uses list-objects-v2 (1000 objects/page via API) instead of `aws s3 ls`
+# which streams all metadata as text. This is 10-50x faster.
+# Total is updated PROGRESSIVELY as each page comes in.
+(
+    TOTAL=0
+    TOKEN=""
+    PAGE=0
+    while true; do
+        CMD_ARGS=(s3api list-objects-v2
+            --bucket "$SOURCE_VOLUME_ID"
+            --endpoint-url "$SOURCE_ENDPOINT"
+            --output json)
+        [ -n "$TOKEN" ] && CMD_ARGS+=(--continuation-token "$TOKEN")
+
+        RESULT=$(aws "${CMD_ARGS[@]}" 2>/dev/null) || break
+        COUNT=$(echo "$RESULT" | jq '.KeyCount // 0')
+        TOTAL=$((TOTAL + COUNT))
+        PAGE=$((PAGE + 1))
+
+        # Progressive update: write current total so reporter can use it immediately
+        echo "$TOTAL" > "$FILES_TOTAL_FILE"
+
+        # Check if there are more pages
+        IS_TRUNCATED=$(echo "$RESULT" | jq -r '.IsTruncated // false')
+        if [ "$IS_TRUNCATED" = "true" ]; then
+            TOKEN=$(echo "$RESULT" | jq -r '.NextContinuationToken // empty')
+            [ -z "$TOKEN" ] && break
+        else
+            break
+        fi
+    done
+    echo "S3 API discovery: ${TOTAL} objects (${PAGE} pages)" >&2
+) &
+DISCOVERY_PID=$!
+echo "Fast S3 API discovery started in background (list-objects-v2)"
+
+# Report initial state
+report_progress "syncing" 0 0
+
+# ── Background progress reporter: every 10s, POST current counts ──
+if [ -n "$PROGRESS_CALLBACK_URL" ]; then
+    (
+        while true; do
+            sleep 10
+            CURRENT=$(cat "$PROGRESS_FILE" 2>/dev/null || echo "0")
+            TOTAL=$(cat "$FILES_TOTAL_FILE" 2>/dev/null || echo "0")
+            report_progress "syncing" "$CURRENT" "$TOTAL"
+        done
+    ) &
+    REPORTER_PID=$!
+    echo "Progress reporter started (PID: $REPORTER_PID)"
+fi
+
+# ── Run actual sync immediately — zero wait ──
 aws s3 sync "s3://${SOURCE_VOLUME_ID}/" "${TARGET_DIR}/" \
     --endpoint-url "$SOURCE_ENDPOINT" \
     --region "$REGION" \
     "${SYNC_EXCLUDES[@]}" \
-    --dryrun 2>/dev/null > "$DRYRUN_OUTPUT" &
-DRYRUN_PID=$!
+    --no-progress \
+    2>&1 | tee /tmp/sync.log | awk -v pf="$PROGRESS_FILE" '
+        /download:/ {
+            count++
+            print count > pf
+            close(pf)
+        }
+        { print }
+    '
 
-# Wait up to DISCOVERY_TIMEOUT seconds
-WAITED=0
-while kill -0 "$DRYRUN_PID" 2>/dev/null; do
-    if [ "$WAITED" -ge "$DISCOVERY_TIMEOUT" ]; then
-        echo "Discovery timed out after ${DISCOVERY_TIMEOUT}s, skipping file count"
-        kill "$DRYRUN_PID" 2>/dev/null
-        wait "$DRYRUN_PID" 2>/dev/null
-        DISCOVERY_SKIPPED=true
-        break
-    fi
-    sleep 1
-    WAITED=$((WAITED + 1))
-done
+SYNC_STATUS=${PIPESTATUS[0]}
 
-# If dryrun completed in time, parse its output
-if [ "$DISCOVERY_SKIPPED" = false ]; then
-    wait "$DRYRUN_PID"
-    DRYRUN_EXIT=$?
-    if [ "$DRYRUN_EXIT" -eq 0 ]; then
-        FILES_TOTAL=$(grep -c "download:" "$DRYRUN_OUTPUT" 2>/dev/null || echo "0")
-        echo "Files to sync: $FILES_TOTAL"
-    else
-        echo "WARNING: Dryrun failed (exit $DRYRUN_EXIT), proceeding without file count"
-    fi
+# ── Cleanup background processes ──
+if [ -n "$REPORTER_PID" ]; then
+    kill "$REPORTER_PID" 2>/dev/null
+    wait "$REPORTER_PID" 2>/dev/null
+fi
+if kill -0 "$DISCOVERY_PID" 2>/dev/null; then
+    kill "$DISCOVERY_PID" 2>/dev/null
+    wait "$DISCOVERY_PID" 2>/dev/null
 fi
 
-# Edge case: dryrun completed and found 0 files → already synced
-if [ "$DISCOVERY_SKIPPED" = false ] && [ "$FILES_TOTAL" -eq 0 ]; then
-    echo "No files to sync — already up to date"
-    report_progress "already_synced" 0 0
+# Fallback: check for fatal errors in log
+if [ $SYNC_STATUS -eq 0 ] && grep -q "fatal error" /tmp/sync.log; then
+    echo "WARNING: Detected fatal error in log despite exit code 0"
+    SYNC_STATUS=1
+fi
 
-    SYNC_STATUS=0
-    SYNC_DURATION=0
+SYNC_END=$(date +%s)
+SYNC_DURATION=$((SYNC_END - SYNC_START))
+FILES_SYNCED=$(cat "$PROGRESS_FILE" 2>/dev/null || echo "0")
+FILES_TOTAL=$(cat "$FILES_TOTAL_FILE" 2>/dev/null || echo "0")
+
+echo ""
+echo "=== Sync Complete ==="
+echo "Duration: ${SYNC_DURATION}s"
+echo "Files downloaded: ${FILES_SYNCED}"
+echo "Objects in bucket: ~${FILES_TOTAL}"
+echo "Exit code: ${SYNC_STATUS}"
+
+# Determine final status
+if [ $SYNC_STATUS -eq 0 ]; then
     FINAL_STATUS="synced"
-
-    # Jump to callback
-    echo "=== Sync Complete (no-op) ==="
-else
-    # Report discovery results
-    report_progress "syncing" 0 "$FILES_TOTAL"
-
-    # ── Phase 2: Actual sync with progress tracking ──
-    echo ""
-    echo "=== Starting S3 Sync ==="
-    SYNC_START=$(date +%s)
-
-    # Progress counter file (written by awk, read by reporter)
-    PROGRESS_FILE="/tmp/sync_progress"
-    echo "0" > "$PROGRESS_FILE"
-
-    # Background progress reporter: every 10s, POST current count
-    if [ -n "$PROGRESS_CALLBACK_URL" ] && [ "$FILES_TOTAL" -gt 0 ]; then
-        (
-            while true; do
-                sleep 10
-                CURRENT=$(cat "$PROGRESS_FILE" 2>/dev/null || echo "0")
-                report_progress "syncing" "$CURRENT" "$FILES_TOTAL"
-            done
-        ) &
-        REPORTER_PID=$!
-        echo "Progress reporter started (PID: $REPORTER_PID)"
-    fi
-
-    # Run sync, pipe through awk to count completed files
-    aws s3 sync "s3://${SOURCE_VOLUME_ID}/" "${TARGET_DIR}/" \
-        --endpoint-url "$SOURCE_ENDPOINT" \
-        --region "$REGION" \
-        "${SYNC_EXCLUDES[@]}" \
-        --no-progress \
-        2>&1 | tee /tmp/sync.log | awk -v pf="$PROGRESS_FILE" '
-            /download:/ {
-                count++
-                print count > pf
-                close(pf)
-            }
-            { print }
-        '
-
-    SYNC_STATUS=${PIPESTATUS[0]}
-
-    # Kill background reporter
-    if [ -n "$REPORTER_PID" ]; then
-        kill "$REPORTER_PID" 2>/dev/null
-        wait "$REPORTER_PID" 2>/dev/null
-    fi
-
-    # Fallback: check for fatal errors in log if PIPESTATUS didn't capture it
-    if [ $SYNC_STATUS -eq 0 ] && grep -q "fatal error" /tmp/sync.log; then
-        echo "WARNING: Detected fatal error in log despite exit code 0"
-        SYNC_STATUS=1
-    fi
-
-    SYNC_END=$(date +%s)
-    SYNC_DURATION=$((SYNC_END - SYNC_START))
-
-    echo ""
-    echo "=== Sync Complete ==="
-    echo "Duration: ${SYNC_DURATION}s"
-    echo "Exit code: ${SYNC_STATUS}"
-
-    # Determine final status
-    if [ $SYNC_STATUS -eq 0 ]; then
-        FINAL_STATUS="synced"
-        echo "Status: SUCCESS"
-        # Report 100% completion
+    echo "Status: SUCCESS"
+    # Report 100%: use total from discovery if available, otherwise use synced count
+    if [ "$FILES_TOTAL" -gt 0 ]; then
         report_progress "syncing" "$FILES_TOTAL" "$FILES_TOTAL"
     else
-        FINAL_STATUS="failed"
-        echo "Status: FAILED"
+        report_progress "syncing" "$FILES_SYNCED" "$FILES_SYNCED"
     fi
+else
+    FINAL_STATUS="failed"
+    echo "Status: FAILED"
 fi
 
-# ── Phase 3: Send completion callback ──
+# ── Send completion callback ──
 if [ -n "$CALLBACK_URL" ]; then
     echo ""
     echo "=== Sending Callback ==="
